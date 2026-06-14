@@ -1,8 +1,10 @@
 # ResearchLens
 
-> Upload a research paper. Get a summary, research gaps, and cited answers to your questions — instantly.
+> A multi-capability RAG system for academic research — upload a paper, get a structured summary, identify research gaps, ask questions grounded in the document, and compare insights across multiple papers.
 
 ---
+
+## What it does
 
 ## What it does
 
@@ -10,9 +12,8 @@
 - **Ask questions** → RAG pipeline retrieves relevant chunks, generates cited answers
 - **Off-topic guardrail** → LLM classifier blocks non-paper questions before they hit the pipeline
 - **Web search fallback** → triggers Tavily if the paper can't answer the query
-- **Compare papers** → structured cross-paper analysis across multiple sessions
+- **Compare multiple papers simultaneously** → select any number of past sessions and get a structured cross-paper breakdown: extracted facts table (datasets, metrics, model type, limitations), dimensional ratings (Novelty, Rigor, Generalization, Scalability), core differences, and a contextual verdict on which paper is stronger for what problem
 - **Auth + sessions** → every user's papers, chats, and summaries are persisted and reloadable
-
 ---
 
 ## Tech Stack
