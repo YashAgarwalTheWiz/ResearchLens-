@@ -2,7 +2,7 @@ import fitz
 from graph.state import CitationObject
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=150)
 def parse_pdf(pdf_path):
     doc=fitz.open(pdf_path)
     chunk_index=0

@@ -54,6 +54,14 @@ st.markdown("""
         padding: 14px 18px;
         margin-bottom: 8px;
     }
+
+    .comparison-box {
+        background-color: #1A1D29;
+        border: 1px solid #7C5CFC;
+        border-radius: 10px;
+        padding: 20px 24px;
+        margin-top: 12px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -71,6 +79,28 @@ if "summary" not in st.session_state:
     st.session_state.summary = None
 if "research_gaps" not in st.session_state:
     st.session_state.research_gaps = None
+if "pdf_name" not in st.session_state:
+    st.session_state.pdf_name = None
+if "metadata" not in st.session_state:
+    st.session_state.metadata = {}
+if "comparison" not in st.session_state:
+    st.session_state.comparison = None
+if "compare_papers" not in st.session_state:
+    st.session_state.compare_papers = []
+
+
+# ── HELPER ─────────────────────────────────────────────────────────────────────
+def load_session_data(session_id: str, token: str):
+    """Fetch cached summary, gaps, metadata from DB via /session-data."""
+    res = requests.post(f"{API_URL}/session-data", json={"session_id": session_id, "token": token})
+    if res.status_code == 200:
+        data = res.json()
+        st.session_state.summary = data["summary"]
+        st.session_state.research_gaps = data["research_gaps"]
+        st.session_state.metadata = data.get("metadata", {})
+        st.session_state.pdf_name = data["pdf_name"]
+    else:
+        st.error("Failed to load session data.")
 
 
 # ── AUTH PAGE ──────────────────────────────────────────────────────────────────
@@ -92,7 +122,7 @@ if st.session_state.token is None:
                     st.rerun()
                 else:
                     try:
-                        detail = res.json().get("detail", "Registration failed")
+                        detail = res.json().get("detail", "Login failed")
                     except Exception:
                         detail = f"Server error ({res.status_code}): {res.text[:300]}"
                     st.error(detail)
@@ -130,6 +160,7 @@ elif st.session_state.session_id is None:
 
     st.subheader("Your Past Sessions")
 
+    sessions = []
     res = requests.post(f"{API_URL}/my-sessions", json={"token": st.session_state.token})
     if res.status_code == 200:
         sessions = res.json()["sessions"]
@@ -145,16 +176,60 @@ elif st.session_state.session_id is None:
                 with col_b:
                     st.write("")  # vertical alignment nudge
                     if st.button("Load", key=s["session_id"]):
+                        load_session_data(s["session_id"], st.session_state.token)
                         st.session_state.session_id = s["session_id"]
                         st.session_state.chat_history = []
-                        st.session_state.summary = None
-                        st.session_state.research_gaps = None
+                        st.session_state.comparison = None
+                        st.session_state.compare_papers = []
                         st.rerun()
         else:
             st.info("No past sessions yet. Upload a paper below to get started.")
     else:
         st.error("Could not load sessions.")
 
+    # ── Compare Papers ─────────────────────────────────────────────────────────
+    if len(sessions) >= 2:
+        st.divider()
+        st.subheader("🔬 Compare Papers")
+
+        # Map "pdf_name (date)" → session_id to handle duplicate filenames
+        label_to_id = {
+            f"{s['pdf_name']} ({s['created_at'][:10]})": s["session_id"]
+            for s in sessions
+        }
+
+        selected_labels = st.multiselect(
+            "Select 2 or more papers to compare",
+            options=list(label_to_id.keys()),
+            placeholder="Choose papers..."
+        )
+
+        if len(selected_labels) >= 2:
+            if st.button("Compare Selected Papers", type="primary"):
+                selected_ids = [label_to_id[label] for label in selected_labels]
+                with st.spinner("Analyzing and comparing papers..."):
+                    compare_res = requests.post(f"{API_URL}/compare", json={
+                        "session_ids": selected_ids,
+                        "token": st.session_state.token
+                    })
+                if compare_res.status_code == 200:
+                    data = compare_res.json()
+                    st.session_state.comparison = data["comparison"]
+                    st.session_state.compare_papers = data["papers"]
+                    st.rerun()
+                else:
+                    st.error(f"Comparison failed: {compare_res.text}")
+
+        if st.session_state.comparison:
+            paper_names = " vs ".join([p["pdf_name"] for p in st.session_state.compare_papers])
+            st.markdown(f"**Comparing:** {paper_names}")
+            st.markdown(st.session_state.comparison)
+            if st.button("Clear Comparison"):
+                st.session_state.comparison = None
+                st.session_state.compare_papers = []
+                st.rerun()
+
+    # ── Upload ─────────────────────────────────────────────────────────────────
     st.divider()
     st.caption("⚠️ Please limit uploads to 20 pages or fewer. Larger PDFs may exceed the daily AI usage quota and fail to process.")
     st.subheader("Upload a New Paper")
@@ -168,10 +243,12 @@ elif st.session_state.session_id is None:
                 response = requests.post(f"{API_URL}/upload", files=files, data=data)
 
             if response.status_code == 200:
-                st.session_state.session_id = response.json()["session_id"]
+                new_session_id = response.json()["session_id"]
+                load_session_data(new_session_id, st.session_state.token)
+                st.session_state.session_id = new_session_id
                 st.session_state.chat_history = []
-                st.session_state.summary = None
-                st.session_state.research_gaps = None
+                st.session_state.comparison = None
+                st.session_state.compare_papers = []
                 st.success("PDF processed successfully!")
                 st.rerun()
             else:
@@ -188,14 +265,21 @@ else:
             st.session_state.chat_history = []
             st.session_state.summary = None
             st.session_state.research_gaps = None
+            st.session_state.pdf_name = None
+            st.session_state.metadata = {}
             st.rerun()
     with col3:
         if st.button("Logout"):
             st.session_state.token = None
             st.session_state.session_id = None
+            st.session_state.summary = None
+            st.session_state.research_gaps = None
+            st.session_state.pdf_name = None
+            st.session_state.metadata = {}
             st.rerun()
 
-    st.caption(f"Session: `{st.session_state.session_id}`")
+    paper_label = st.session_state.pdf_name or st.session_state.session_id
+    st.caption(f"📄 **{paper_label}** · Session: `{st.session_state.session_id}`")
 
     tab1, tab2, tab3 = st.tabs(["💬 Chat", "📝 Summary", "🔍 Research Gaps"])
 
@@ -238,37 +322,15 @@ else:
 
     # --- Summary tab ---
     with tab2:
-        if st.session_state.summary is None:
-            if st.button("Generate Summary", type="primary"):
-                with st.spinner("Generating summary..."):
-                    response = requests.post(f"{API_URL}/query", json={
-                        "session_id": st.session_state.session_id,
-                        "query": "summarize this paper",
-                        "token": st.session_state.token
-                    })
-                if response.status_code == 200:
-                    st.session_state.summary = response.json()["summary"]
-                    st.rerun()
-                else:
-                    st.error(f"Failed: {response.text}")
-        else:
+        if st.session_state.summary:
             st.markdown(st.session_state.summary)
+        else:
+            st.info("No summary available for this paper.")
 
     # --- Research Gaps tab ---
     with tab3:
-        if st.session_state.research_gaps is None:
-            if st.button("Find Research Gaps", type="primary"):
-                with st.spinner("Analyzing gaps..."):
-                    response = requests.post(f"{API_URL}/query", json={
-                        "session_id": st.session_state.session_id,
-                        "query": "what are the research gaps",
-                        "token": st.session_state.token
-                    })
-                if response.status_code == 200:
-                    st.session_state.research_gaps = response.json()["research_gaps"]
-                    st.rerun()
-                else:
-                    st.error(f"Failed: {response.text}")
-        else:
+        if st.session_state.research_gaps:
             for gap in st.session_state.research_gaps:
                 st.markdown(f'<div class="gap-card">{gap}</div>', unsafe_allow_html=True)
+        else:
+            st.info("No research gaps found for this paper.")

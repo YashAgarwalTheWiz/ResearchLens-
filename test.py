@@ -1,32 +1,13 @@
-from services.qdrant_service import init_collection
-from graph.builder import build_graph
+from services.text_sections import text_sections
 
-# 1. Init Qdrant collection
-init_collection()
+# Case 1: normal paper with a references section
+paper = ("Introduction content " * 500) + "References\n" + ("Ref item " * 200)
+result = text_sections(paper)
+print("head:", len(result["head"]))
+print("tail:", len(result["tail"]))
+print("middle:", len(result["middle"]))
 
-# 2. Build the graph
-graph = build_graph()
-
-# 3. Define initial state
-state = {
-    'pdf_path': 'test2.pdf',
-    'query': 'What is the current state-of-the-art top-1 accuracy on ImageNet using Vision Transformers?',
-    'query_type': '',
-    'chunks': [],
-    'retrieved_docs': [],
-    'web_search_triggered': False,
-    'summary': '',
-    'research_gaps': [],
-    'answer': '',
-    'citations': [],
-    'chat_history': []
-}
-
-# 4. Run it
-result = graph.invoke(state)
-
-# 5. Print output
-print(result['web_search_triggered']) 
-print('_*20')
-print(result['retrieved_docs']) 
-print('_*20')
+# Case 2: short paper — does middle come back empty?
+short = "Intro. Method. Result. References. Bib."
+result2 = text_sections(short, head_chars=50, tail_chars=10)
+print("short paper middle:", repr(result2["middle"]))

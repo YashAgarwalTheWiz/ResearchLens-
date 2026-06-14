@@ -1,5 +1,15 @@
 from typing import TypedDict,List
 
+class PaperMetadata(TypedDict):
+    title:str
+    authors:List[str]
+    year:str
+    dataset:List[str]
+    methodology:str
+    metrics:List[str]
+    limitations:List[str]
+    future_work:List[str]
+
 class CitationObject(TypedDict):
     chunk_text:str
     page_number:int
@@ -12,6 +22,7 @@ class RetrievedDoc(TypedDict):
     relevance_score:float
 
 class ResearchState(TypedDict):
+    metadata:PaperMetadata
     session_id: str
     pdf_path:str
     query:str

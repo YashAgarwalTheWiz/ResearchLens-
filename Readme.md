@@ -1,146 +1,207 @@
 # ResearchLens
 
-A multi-capability RAG (Retrieval-Augmented Generation) system that helps researchers analyze academic papers — summarizing content, identifying research gaps, and answering questions grounded in the paper (with web search fallback for queries the paper doesn't cover).
+> A multi-capability RAG system for academic research — upload a paper, get a structured summary, identify research gaps, ask questions grounded in the document, and compare insights across multiple papers.
+
+---
 
 ## Features
 
-- **PDF Ingestion** — Upload a research paper and have it parsed, chunked, and embedded for retrieval.
-- **Summarization** — Get a concise summary of the uploaded paper.
-- **Research Gap Analysis** — Automatically identify limitations, untested domains, open questions, and suggested future work mentioned in the paper.
-- **Question Answering (RAG)** — Ask questions about the paper; answers are grounded in retrieved chunks, with citations.
-- **Web Search Fallback** — If the paper doesn't contain enough information to answer a query, the system falls back to live web search (Tavily) before generating a response.
-- **User Authentication** — Register/login with token-based auth; each user's sessions and chat history are saved.
-- **Session History** — Revisit past uploads and conversations from a dashboard.
+- **Intelligent PDF Ingestion** — Upload any research paper. Text is extracted page-by-page (PyMuPDF), chunked, embedded, and stored in Qdrant. SHA-256 hashing prevents duplicate processing — re-uploading the same paper instantly returns the existing session.
+- **Structured Summarization** — Automatically generates a three-section summary (Contributions, Methodology, Results) on upload. Cached in the database; served instantly on every subsequent request.
+- **Research Gap Analysis** — Identifies untested domains, unvalidated assumptions, open questions from the paper body, and explicit limitations and future work from the authors. All gaps are cached at upload time.
+- **Cited Question Answering (RAG)** — Ask any question about the paper. Answers are grounded in retrieved chunks with page-level citations. A score-based grader skips redundant LLM calls for high-confidence matches.
+- **Web Search Fallback** — When the paper's content is insufficient to answer a query, Tavily web search is triggered automatically before generation.
+- **Multi-Paper Comparison** — Select two or more past sessions and generate a structured cross-paper analysis: core problems, methodological differences, conflicting or complementary findings, and a reasoned verdict on which approach is strongest.
+- **User Authentication** — Register and log in with token-based auth. Each user's sessions, chat history, summaries, and gap analyses are isolated and persisted.
+- **Session Dashboard** — All past uploads are accessible from the dashboard. Load any session to immediately resume with full summary, gaps, and chat history context restored.
+
+---
+
+## Architecture
+
+ResearchLens is built around two LangGraph graphs that run at different points in the application lifecycle.
+
+### Ingestion Graph
+
+Runs **once per PDF upload**. All expensive operations — summarization, gap analysis, metadata extraction — happen here and are persisted to the database. Subsequent requests for the same data are pure database reads.
+
+```
+pdf_parser → embedder → metadata_extractor → summarizer → gap_finder
+```
+
+| Node                 | Responsibility                                                                                          |
+| -------------------- | ------------------------------------------------------------------------------------------------------- |
+| `pdf_parser`         | Extracts page-level text from the PDF using PyMuPDF                                                     |
+| `embedder`           | Generates 384-dim embeddings and upserts chunks to Qdrant                                               |
+| `metadata_extractor` | Extracts title, authors, abstract, limitations, and future work via LLM                                 |
+| `summarizer`         | Produces a structured three-section summary from the paper's head and tail zones                        |
+| `gap_finder`         | Identifies research gaps from the paper's middle zone; merges with metadata limitations and future work |
+
+### Query Graph
+
+Runs **per user QA query only**. Summary and gap queries are intercepted at the server level and served from cache — the graph is never invoked for them.
+
+```
+chunk_loader → query_router → retriever → grader → [web_search] → generator → citation_builder
+```
+
+| Node               | Responsibility                                                                                        |
+| ------------------ | ----------------------------------------------------------------------------------------------------- |
+| `chunk_loader`     | Loads all chunks for the session from Qdrant                                                          |
+| `query_router`     | Routes the query (all graph-level queries are QA by the time they reach here)                         |
+| `retriever`        | Cosine similarity search in Qdrant; returns top-k chunks with relevance scores                        |
+| `grader`           | Passes chunks above a score threshold directly; sends borderline chunks to LLM for relevance judgment |
+| `web_search`       | Triggered when no relevant chunks are found; queries Tavily for supplementary context                 |
+| `generator`        | Generates the final answer using retrieved and/or web context                                         |
+| `citation_builder` | Attaches page-level citations to the response                                                         |
+
+### Zone-Based Text Splitting
+
+Rather than blindly slicing the full paper text, all LLM calls operate on named zones extracted by `services/text_sections.py`:
+
+| Zone     | Definition                                                    | Used by                            |
+| -------- | ------------------------------------------------------------- | ---------------------------------- |
+| `head`   | First 8,000 characters                                        | `metadata_extractor`, `summarizer` |
+| `tail`   | Last 5,000 characters before the references section           | `metadata_extractor`, `summarizer` |
+| `middle` | Everything between head and tail, capped at 15,000 characters | `gap_finder`                       |
+
+This keeps every LLM call well within Groq's token limits while targeting each zone at the content that actually lives there: introductions and abstracts at the head, conclusions and results at the tail, methodology and experiments in the middle.
+
+### Query Classification and Caching
+
+```
+Incoming /query request
+        │
+        ▼
+classify_query() — keyword matching, no LLM
+        │
+   ┌────┴────┐
+   │         │
+summary    gap        qa
+   │         │          │
+   ▼         ▼          ▼
+DB read   DB read   query_graph.invoke()
+```
+
+Summary and gap queries never touch the LLM or the graph. They are keyword-classified at the server level and returned directly from the cached database columns populated during ingestion.
+
+---
 
 ## Tech Stack
 
-| Component           | Technology                                                    |
-| ------------------- | ------------------------------------------------------------- |
-| LLM                 | Groq (`llama-3.3-70b-versatile`)                              |
-| Embeddings          | Cohere (`embed-english-light-v3.0`, 384-dim, cosine distance) |
-| Vector Database     | Qdrant Cloud                                                  |
-| Orchestration       | LangGraph                                                     |
-| Backend API         | FastAPI                                                       |
-| Frontend            | Streamlit                                                     |
-| Relational Database | Supabase (PostgreSQL via psycopg2)                            |
-| Web Search Fallback | Tavily                                                        |
-| PDF Parsing         | PyMuPDF                                                       |
+| Component           | Technology                                                   |
+| ------------------- | ------------------------------------------------------------ |
+| LLM                 | Groq — `llama-3.3-70b-versatile`                             |
+| Embeddings          | HuggingFace sentence-transformers (384-dim, cosine distance) |
+| Vector Database     | Qdrant Cloud                                                 |
+| Graph Orchestration | LangGraph                                                    |
+| Backend API         | FastAPI                                                      |
+| Frontend            | Streamlit                                                    |
+| Relational Database | Supabase (PostgreSQL via psycopg2)                           |
+| Web Search Fallback | Tavily                                                       |
+| PDF Parsing         | PyMuPDF                                                      |
+| Tracing             | LangSmith                                                    |
 
-## Architecture / Workflow
-
-ResearchLens is built around two LangGraph graphs: an **ingestion graph** (runs once per uploaded PDF) and a **query graph** (runs per user query).
-
-### 1. Ingestion Graph
-
-```
-                ┌─────────────┐        ┌───────────┐
-   PDF Upload → │  pdf_parser │ ─────→ │  embedder │ → Qdrant (vector store)
-                └─────────────┘        └───────────┘
-```
-
-- **pdf_parser** — Extracts text from the uploaded PDF (PyMuPDF) and splits it into chunks.
-- **embedder** — Generates embeddings for each chunk (Cohere) and stores them in Qdrant under the paper's session/collection.
-
-### 2. Query Graph
-
-```
-                ┌──────────────┐     ┌───────────────┐
-  User Query →  │ chunk_loader  │ →  │  query_router │
-                └──────────────┘     └───────┬───────┘
-                                              │
-                  ┌───────────────────────────┼───────────────────────────┐
-                  │                           │                           │
-                  ▼                           ▼                           ▼
-           ┌─────────────┐            ┌─────────────┐            ┌──────────────┐
-           │ summarizer  │            │ gap_finder  │            │  retriever   │
-           └─────────────┘            └─────────────┘            └──────┬───────┘
-                  │                           │                          ▼
-                  │                           │                   ┌──────────────┐
-                  │                           │                   │    grader    │
-                  │                           │                   └──────┬───────┘
-                  │                           │                          │
-                  │                           │              ┌───────────┴───────────┐
-                  │                           │              │ (insufficient context)│
-                  │                           │              ▼                       │
-                  │                           │       ┌──────────────┐               │
-                  │                           │       │  web_search   │              │
-                  │                           │       └──────┬───────┘               │
-                  │                           │              │                       │
-                  │                           │              ▼                       ▼
-                  │                           │       ┌────────────────────────────────┐
-                  │                           │       │           generator            │
-                  │                           │       └───────────────┬────────────────┘
-                  │                           │                        ▼
-                  │                           │              ┌──────────────────┐
-                  │                           │              │ citation_builder │
-                  │                           │              └──────────────────┘
-                  ▼                           ▼                        ▼
-              [Response]                  [Response]               [Response]
-```
-
-- **chunk_loader** — Loads the relevant chunks/embeddings for the current session from Qdrant.
-- **query_router** — Classifies the user's intent: summary request, gap-analysis request, or a general question.
-- **summarizer** — Produces a summary of the paper directly from loaded chunks.
-- **gap_finder** — Analyzes chunks for explicit limitations, untested areas, open questions, suggested future work, and unvalidated assumptions; returns a structured list of research gaps.
-- **retriever** — Performs similarity search in Qdrant to retrieve chunks relevant to the query.
-- **grader** — Evaluates whether retrieved chunks are sufficient to answer the query.
-- **web_search** — Triggered only if the grader determines the paper's content is insufficient; queries Tavily for supplementary information.
-- **generator** — Produces the final answer using retrieved (and optionally web-searched) context.
-- **citation_builder** — Attaches source citations (paper chunks and/or web sources) to the generated answer.
+---
 
 ## Project Structure
 
 ```
-config.py                      ← loads all API keys/config from environment variables
-app_frontend.py                ← Streamlit frontend (login/register → dashboard → chat)
-api/
-  server.py                    ← FastAPI app, all endpoints
-  auth_router.py                ← /register and /login endpoints
-services/
-  auth_service.py               ← password hashing, token generation/validation
-  embedding_service.py          ← Cohere embeddings
-  pdf_service.py                ← PyMuPDF + text splitter
-  qdrant_service.py              ← Qdrant CRUD, scroll, search
-graph/
-  state.py                       ← ResearchState TypedDict
-  builder.py                     ← ingestion graph + query graph definitions
-nodes/
-  pdf_parser.py
-  chunk_loader.py
-  embedder.py
-  retriever.py
-  grader.py
-  query_router.py
-  web_search.py
-  summarizer.py
-  gap_finder.py
-  generator.py
-  citation_builder.py
+ResearchLens/
+├── config.py                   # All environment variables and constants (HEAD_CHARS, TAIL_CHARS, GAP_MAX_CHARS)
+├── app_frontend.py             # Streamlit frontend — auth, dashboard, session view, comparison UI
+├── requirements.txt
+│
+├── api/
+│   ├── server.py               # FastAPI app — all endpoints, query classification, caching logic
+│   └── auth_router.py          # /register and /login
+│
+├── services/
+│   ├── auth_service.py         # Token generation and validation, bcrypt password hashing
+│   ├── embedding_service.py    # HuggingFace embedding wrapper
+│   ├── pdf_service.py          # PyMuPDF extraction + text chunking (chunk_size=1200, overlap=150)
+│   ├── qdrant_service.py       # Qdrant upsert, search, scroll
+│   └── text_sections.py        # Zone-based text splitter — head / middle / tail
+│
+├── graph/
+│   ├── state.py                # ResearchState TypedDict, CitationObject, RetrievedDoc
+│   └── builder.py              # Ingestion graph and query graph definitions
+│
+└── nodes/
+    ├── pdf_parser.py
+    ├── embedder.py
+    ├── metadata_extractor.py
+    ├── summarizer.py
+    ├── gap_finder.py
+    ├── chunk_loader.py
+    ├── query_router.py
+    ├── retriever.py
+    ├── grader.py
+    ├── web_search.py
+    ├── generator.py
+    └── citation_builder.py
 ```
 
-## Database Schema (Supabase / PostgreSQL)
+---
 
-| Table             | Columns                                                           |
-| ----------------- | ----------------------------------------------------------------- |
-| `rpa_users`       | `user_id`, `email`, `password_hash`, `created_at`                 |
-| `rpa_user_tokens` | `token`, `user_id`, `created_at`                                  |
-| `rpa_sessions`    | `session_id`, `chat_history`, `user_id`, `pdf_name`, `created_at` |
+## Database Schema
 
-All tables use the `rpa_` prefix to avoid collisions with other projects sharing the same database.
+All tables use the `rpa_` prefix to avoid collisions in a shared database.
 
-## Authentication
+### `rpa_users`
 
-- Simple UUID-based bearer tokens (stored in `rpa_user_tokens`), not JWT.
-- `/register` and `/login` endpoints handled in `auth_router.py`.
-- All protected endpoints (`/upload`, `/query`, `/my-sessions`) require a valid token.
-- Passwords are hashed with `passlib` (bcrypt backend).
+| Column          | Type      | Notes       |
+| --------------- | --------- | ----------- |
+| `user_id`       | UUID      | Primary key |
+| `email`         | TEXT      | Unique      |
+| `password_hash` | TEXT      | bcrypt      |
+| `created_at`    | TIMESTAMP |             |
+
+### `rpa_user_tokens`
+
+| Column       | Type      | Notes                     |
+| ------------ | --------- | ------------------------- |
+| `token`      | TEXT      | Primary key               |
+| `user_id`    | UUID      | Foreign key → `rpa_users` |
+| `created_at` | TIMESTAMP |                           |
+
+### `rpa_sessions`
+
+| Column          | Type      | Notes                                              |
+| --------------- | --------- | -------------------------------------------------- |
+| `session_id`    | UUID      | Primary key                                        |
+| `user_id`       | UUID      | Foreign key → `rpa_users`                          |
+| `pdf_name`      | TEXT      | Original filename                                  |
+| `pdf_hash`      | TEXT      | SHA-256; used for deduplication                    |
+| `summary`       | TEXT      | Cached at ingestion time                           |
+| `research_gaps` | JSONB     | Cached at ingestion time                           |
+| `metadata`      | JSONB     | Title, authors, abstract, limitations, future work |
+| `chat_history`  | JSONB     | Append-only array of `{role, content}` turns       |
+| `created_at`    | TIMESTAMP |                                                    |
+
+---
+
+## API Endpoints
+
+| Method | Endpoint        | Auth  | Description                                                   |
+| ------ | --------------- | ----- | ------------------------------------------------------------- |
+| POST   | `/register`     | No    | Create a new user account                                     |
+| POST   | `/login`        | No    | Authenticate and receive a token                              |
+| POST   | `/upload`       | Token | Upload and process a PDF; returns `session_id`                |
+| POST   | `/query`        | Token | Ask a question; summary and gap queries are served from cache |
+| POST   | `/my-sessions`  | Token | List all past sessions for the current user                   |
+| POST   | `/session-data` | Token | Fetch cached summary, gaps, and metadata for a single session |
+| POST   | `/compare`      | Token | Compare two or more sessions with a single LLM call           |
+| GET    | `/health`       | No    | Health check                                                  |
+
+---
 
 ## Setup
 
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/YashAgarwalTheWiz/ResearchLens-
 cd ResearchLens
 ```
 
@@ -148,15 +209,15 @@ cd ResearchLens
 
 ```bash
 python -m venv venv
-source venv/bin/activate      # On Windows: venv\Scripts\activate
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
 ### 3. Configure environment variables
 
-Create a `.env` file in the project root with the following keys:
+Create a `.env` file in the project root:
 
-```
+```env
 GROQ_API_KEY=your_groq_api_key
 QDRANT_URL=your_qdrant_cluster_url
 QDRANT_API_KEY=your_qdrant_api_key
@@ -166,52 +227,48 @@ TAVILY_API_KEY=your_tavily_api_key
 DATABASE_URL=your_supabase_postgres_connection_string
 ```
 
-| Variable          | Description                                            | Where to get it                                      |
-| ----------------- | ------------------------------------------------------ | ---------------------------------------------------- |
-| `GROQ_API_KEY`    | API key for the Groq LLM (`llama-3.3-70b-versatile`)   | [console.groq.com](https://console.groq.com)         |
-| `QDRANT_URL`      | URL of your Qdrant Cloud cluster                       | [cloud.qdrant.io](https://cloud.qdrant.io)           |
-| `QDRANT_API_KEY`  | API key for your Qdrant cluster                        | Qdrant Cloud dashboard                               |
-| `COLLECTION_NAME` | Name of the Qdrant collection used to store embeddings | Your choice (default: `research_papers`)             |
-| `COHERE_API_KEY`  | API key for Cohere embeddings                          | [dashboard.cohere.com](https://dashboard.cohere.com) |
-| `TAVILY_API_KEY`  | API key for Tavily web search fallback                 | [tavily.com](https://tavily.com)                     |
-| `DATABASE_URL`    | PostgreSQL connection string for Supabase              | Supabase project settings → Database                 |
+| Variable                        | Where to get it                                                |
+| ------------------------------- | -------------------------------------------------------------- |
+| `GROQ_API_KEY`                  | [console.groq.com](https://console.groq.com)                   |
+| `QDRANT_URL` + `QDRANT_API_KEY` | [cloud.qdrant.io](https://cloud.qdrant.io) — Cluster dashboard |
+| `COHERE_API_KEY`                | [dashboard.cohere.com](https://dashboard.cohere.com)           |
+| `TAVILY_API_KEY`                | [app.tavily.com](https://app.tavily.com)                       |
+| `DATABASE_URL`                  | Supabase project → Settings → Database → Connection string     |
 
-> **Note:** `.env` is excluded from version control via `.gitignore`. Never commit API keys or database credentials.
+> `.env` is excluded from version control. Never commit API keys or database credentials.
 
-### 4. Run the backend (FastAPI)
+### 4. Run the backend
 
 ```bash
 uvicorn api.server:app --reload
 ```
 
-### 5. Run the frontend (Streamlit)
+### 5. Run the frontend
 
 ```bash
 streamlit run app_frontend.py
 ```
 
+The Streamlit app expects the backend at `http://127.0.0.1:8000` by default. Change the `API_URL` constant in `app_frontend.py` if running on a different host or port.
+
+---
+
 ## Usage
 
-1. Register a new account or log in via the Streamlit frontend.
-2. From the dashboard, upload a research paper (PDF, **20 pages or fewer recommended** — larger documents may exceed daily LLM token limits on the free tier).
-3. Once processed, choose to:
-   - Generate a **summary** of the paper.
-   - Run **gap analysis** to identify research gaps.
-   - **Ask questions** about the paper via the chat interface.
-4. Revisit past sessions from the dashboard at any time.
+1. **Register** a new account or **log in** via the dashboard.
+2. **Upload a PDF** (20 pages or fewer recommended — see limitations below). Processing runs the full ingestion pipeline and takes 20–60 seconds depending on paper length.
+3. Once processed, the session opens automatically with:
+   - **Chat tab** — Ask any question about the paper. Answers come with page-level citations.
+   - **Summary tab** — Three-section structured summary, ready instantly.
+   - **Research Gaps tab** — Combined list of implicit gaps (from the paper body) and explicit limitations and future work (from the authors).
+4. Return to the **dashboard** at any time to reload past sessions or compare multiple papers.
+5. To **compare papers**, select two or more from the dashboard multiselect and click **Compare Selected Papers**.
+
+---
 
 ## Known Limitations
 
-- The Groq free tier has a 100,000-token-per-day limit. Summarization and gap analysis are token-intensive operations; processing several large papers per day may exhaust this quota.
-- Recommended PDF size: **20 pages or fewer** for reliable processing within rate limits.
-
-## Roadmap
-
-- [ ] Add LangSmith tracing for observability
-- [ ] Enforce PDF page-count limits at upload time
-- [ ] Token usage tracking and budget warnings
-- [ ] Deploy backend to Render and frontend to Streamlit Cloud
-
-## License
-
-Specify your license here (e.g., MIT).
+- **Groq free tier** has a 6,000 tokens-per-minute limit and a 100,000 tokens-per-day limit. Ingestion (metadata extraction + summarization + gap analysis) consumes approximately 3,000–5,000 tokens per paper. Processing several papers in quick succession may trigger temporary rate limit errors.
+- **Recommended PDF size is 20 pages or fewer.** Larger documents produce more chunks and longer combined text, increasing the risk of hitting per-request token limits even with zone-based splitting.
+- **Web search fallback depends on Tavily's free tier**, which allows 1,000 searches per month. Heavy QA usage on papers with limited content will exhaust this faster.
+- **Chat history is session-local.** Loading a past session restores cached summary and gaps instantly, but the visible chat history starts fresh. The full historical chat context is stored in the database and is passed to the LLM for generation, but it is not rendered in the UI on reload.

@@ -1,10 +1,10 @@
 from langchain_groq import ChatGroq
 from groq import RateLimitError
-from config import GROQ_API_KEY
+from config import GROQ_API_KEY,GAP_MAX_CHARS
 from graph.state import ResearchState
 from pydantic import BaseModel
 from typing import List
-
+from services.text_sections import text_sections
 
 class ResearchGaps(BaseModel):
     gaps: List[str]
@@ -20,18 +20,21 @@ def gap_finder(state: ResearchState) -> dict:
 
     structured_llm = llm.with_structured_output(ResearchGaps)
     combined = "\n\n".join([chunk['chunk_text'] for chunk in state['chunks']])
-    combined = combined[:30000]
-    prompt = f"""You are a critical research analyst. You will be given the text of a research paper.
+    middle_text=text_sections(combined)['middle']
+    middle_text=middle_text[:GAP_MAX_CHARS]
 
-    Identify all research gaps in the paper. Look for:
-    - Explicit limitations acknowledged by the authors
-    - Untested domains or datasets
-    - Open questions left unanswered
-    - Suggested future work
-    - Assumptions that were never validated
+    prompt = f"""You are a critical research analyst. You are given the MIDDLE section of a research paper — the body between the introduction and the conclusion.
 
+    Your task is to identify research gaps embedded within the methodology and findings. Look for:
+    - Untested domains, datasets, or conditions the experiments did not cover
+    - Assumptions made by the authors that were never validated or tested
+    - Open questions raised within the paper body but left unanswered
+    - Weaknesses or gaps in the experimental design or evaluation
+
+    Do NOT include limitations or future work explicitly stated by the authors — those are captured separately.
     Return each gap as a separate, self-contained statement.
-    {combined}
+
+    {middle_text}
     """
 
     for attempt in range(max_retries):
@@ -46,5 +49,6 @@ def gap_finder(state: ResearchState) -> dict:
 
     if response is None:
         return {**state, "error": "Gap analysis failed after multiple attempts."}
-
-    return {**state, 'research_gaps': response.gaps}
+    metadata_gaps=state['metadata']['limitations'] + state['metadata']['future_work']
+    all_gaps=metadata_gaps + response.gaps
+    return {**state, 'research_gaps': all_gaps}
