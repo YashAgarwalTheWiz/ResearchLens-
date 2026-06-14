@@ -9,9 +9,10 @@
 - **Intelligent PDF Ingestion** — Upload any research paper. Text is extracted page-by-page (PyMuPDF), chunked, embedded, and stored in Qdrant. SHA-256 hashing prevents duplicate processing — re-uploading the same paper instantly returns the existing session.
 - **Structured Summarization** — Automatically generates a three-section summary (Contributions, Methodology, Results) on upload. Cached in the database; served instantly on every subsequent request.
 - **Research Gap Analysis** — Identifies untested domains, unvalidated assumptions, open questions from the paper body, and explicit limitations and future work from the authors. All gaps are cached at upload time.
+- **Input Guardrail** — Every query is classified by an LLM before entering the pipeline. Off-topic questions (general knowledge, small talk, code requests, etc.) are rejected immediately with a clear message, without touching retrieval or generation.
 - **Cited Question Answering (RAG)** — Ask any question about the paper. Answers are grounded in retrieved chunks with page-level citations. A score-based grader skips redundant LLM calls for high-confidence matches.
 - **Web Search Fallback** — When the paper's content is insufficient to answer a query, Tavily web search is triggered automatically before generation.
-- **Multi-Paper Comparison** — Select two or more past sessions and generate a structured cross-paper analysis: core problems, methodological differences, conflicting or complementary findings, and a reasoned verdict on which approach is strongest.
+- **Multi-Paper Comparison** — Select two or more past sessions and generate a structured cross-paper analysis. The comparison is split into four parts: an extracted facts table (datasets, key metrics, model type, primary limitation — sourced directly from cached summaries), a dimensional rating across Novelty, Methodological Rigor, Generalization, and Scalability, a core differences section grounded in specific datasets and design choices, and a contextual verdict that states which paper is stronger for what problem rather than making a universal judgment.
 - **User Authentication** — Register and log in with token-based auth. Each user's sessions, chat history, summaries, and gap analyses are isolated and persisted.
 - **Session Dashboard** — All past uploads are accessible from the dashboard. Load any session to immediately resume with full summary, gaps, and chat history context restored.
 
@@ -39,14 +40,15 @@ pdf_parser → embedder → metadata_extractor → summarizer → gap_finder
 
 ### Query Graph
 
-Runs **per user QA query only**. Summary and gap queries are intercepted at the server level and served from cache — the graph is never invoked for them.
+Runs **per user QA query only**. Summary and gap queries are intercepted at the server level and served from cache — the graph is never invoked for them. Off-topic queries are rejected by the guardrail node before any retrieval happens.
 
 ```
-chunk_loader → query_router → retriever → grader → [web_search] → generator → citation_builder
+guardrail → chunk_loader → query_router → retriever → grader → [web_search] → generator → citation_builder
 ```
 
 | Node               | Responsibility                                                                                        |
 | ------------------ | ----------------------------------------------------------------------------------------------------- |
+| `guardrail`        | LLM-based classifier — rejects queries unrelated to research papers before any retrieval happens      |
 | `chunk_loader`     | Loads all chunks for the session from Qdrant                                                          |
 | `query_router`     | Routes the query (all graph-level queries are QA by the time they reach here)                         |
 | `retriever`        | Cosine similarity search in Qdrant; returns top-k chunks with relevance scores                        |
@@ -55,9 +57,28 @@ chunk_loader → query_router → retriever → grader → [web_search] → gene
 | `generator`        | Generates the final answer using retrieved and/or web context                                         |
 | `citation_builder` | Attaches page-level citations to the response                                                         |
 
+### Guardrail Design
+
+The guardrail is the first node in the query graph. It sends the user's question to the LLM with a strict YES/NO classification prompt. If the verdict is NO, `query_type` is set to `blocked` and the graph short-circuits to `END` via a conditional edge — the retrieval pipeline, generator, and citation builder are never invoked. Blocked queries are also not written to chat history.
+
+```
+Incoming QA query
+       │
+       ▼
+   guardrail (LLM classifier)
+       │
+  ┌────┴────┐
+  │         │
+ YES        NO
+  │         │
+  ▼         ▼
+chunk_   return blocked
+loader   response + EXIT
+```
+
 ### Zone-Based Text Splitting
 
-Rather than blindly slicing the full paper text, all LLM calls operate on named zones extracted by `services/text_sections.py`:
+Rather than blindly slicing the full paper text, all LLM calls operate on named zones:
 
 | Zone     | Definition                                                    | Used by                            |
 | -------- | ------------------------------------------------------------- | ---------------------------------- |
@@ -81,6 +102,13 @@ summary    gap        qa
    │         │          │
    ▼         ▼          ▼
 DB read   DB read   query_graph.invoke()
+                         │
+                         ▼
+                     guardrail (LLM)
+                         │
+                  blocked? → return early
+                         │
+                    retrieval pipeline
 ```
 
 Summary and gap queries never touch the LLM or the graph. They are keyword-classified at the server level and returned directly from the cached database columns populated during ingestion.
@@ -139,7 +167,8 @@ ResearchLens/
     ├── grader.py
     ├── web_search.py
     ├── generator.py
-    └── citation_builder.py
+    ├── citation_builder.py
+    └── guardrail.py            # LLM-based input classifier — blocks off-topic queries
 ```
 
 ---
@@ -183,16 +212,16 @@ All tables use the `rpa_` prefix to avoid collisions in a shared database.
 
 ## API Endpoints
 
-| Method | Endpoint        | Auth  | Description                                                   |
-| ------ | --------------- | ----- | ------------------------------------------------------------- |
-| POST   | `/register`     | No    | Create a new user account                                     |
-| POST   | `/login`        | No    | Authenticate and receive a token                              |
-| POST   | `/upload`       | Token | Upload and process a PDF; returns `session_id`                |
-| POST   | `/query`        | Token | Ask a question; summary and gap queries are served from cache |
-| POST   | `/my-sessions`  | Token | List all past sessions for the current user                   |
-| POST   | `/session-data` | Token | Fetch cached summary, gaps, and metadata for a single session |
-| POST   | `/compare`      | Token | Compare two or more sessions with a single LLM call           |
-| GET    | `/health`       | No    | Health check                                                  |
+| Method | Endpoint        | Auth  | Description                                                                                    |
+| ------ | --------------- | ----- | ---------------------------------------------------------------------------------------------- |
+| POST   | `/register`     | No    | Create a new user account                                                                      |
+| POST   | `/login`        | No    | Authenticate and receive a token                                                               |
+| POST   | `/upload`       | Token | Upload and process a PDF; returns `session_id`                                                 |
+| POST   | `/query`        | Token | Ask a question; guardrail blocks off-topic queries; summary/gap served from cache              |
+| POST   | `/my-sessions`  | Token | List all past sessions for the current user                                                    |
+| POST   | `/session-data` | Token | Fetch cached summary, gaps, and metadata for a single session                                  |
+| POST   | `/compare`      | Token | Compare two or more sessions — structured facts table, dimensional ratings, contextual verdict |
+| GET    | `/health`       | No    | Health check                                                                                   |
 
 ---
 
@@ -256,9 +285,9 @@ The Streamlit app expects the backend at `http://127.0.0.1:8000` by default. Cha
 ## Usage
 
 1. **Register** a new account or **log in** via the dashboard.
-2. **Upload a PDF** (20 pages or fewer recommended — see limitations below). Processing runs the full ingestion pipeline and takes 20–60 seconds depending on paper length.
+2. **Upload a PDF** (20 pages or fewer recommended). Processing runs the full ingestion pipeline and takes 20–60 seconds depending on paper length.
 3. Once processed, the session opens automatically with:
-   - **Chat tab** — Ask any question about the paper. Answers come with page-level citations.
+   - **Chat tab** — Ask any question about the paper. Off-topic questions are rejected by the guardrail. Answers come with page-level citations.
    - **Summary tab** — Three-section structured summary, ready instantly.
    - **Research Gaps tab** — Combined list of implicit gaps (from the paper body) and explicit limitations and future work (from the authors).
 4. Return to the **dashboard** at any time to reload past sessions or compare multiple papers.
@@ -272,3 +301,4 @@ The Streamlit app expects the backend at `http://127.0.0.1:8000` by default. Cha
 - **Recommended PDF size is 20 pages or fewer.** Larger documents produce more chunks and longer combined text, increasing the risk of hitting per-request token limits even with zone-based splitting.
 - **Web search fallback depends on Tavily's free tier**, which allows 1,000 searches per month. Heavy QA usage on papers with limited content will exhaust this faster.
 - **Chat history is session-local.** Loading a past session restores cached summary and gaps instantly, but the visible chat history starts fresh. The full historical chat context is stored in the database and is passed to the LLM for generation, but it is not rendered in the UI on reload.
+- **Guardrail adds one LLM call per QA query.** This counts against the Groq token limit. Summary and gap queries bypass the guardrail entirely since they never reach the graph.
