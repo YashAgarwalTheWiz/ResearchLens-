@@ -1,71 +1,47 @@
 import uuid
-import shutil
 import os
 import json
 import hashlib
-import psycopg2
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from pydantic import BaseModel
 
-from graph.builder import build_ingestion_graph, build_query_graph
-from services.qdrant_service import init_collection
+from graph.builder import build_ingestion_graph, build_query_graph, build_positioning_graph
+from schemas.paper import NOT_STATED
+from services.db import get_connection, init_db, loads
 from services.auth_service import validate_token
+from services.llm_service import text_call, RateLimited
 from api.auth_router import router as auth_router
-from config import DATABASE_URL
-from langchain_groq import ChatGroq
-from config import GROQ_API_KEY
-
-compare_llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=GROQ_API_KEY)
 
 app = FastAPI()
 app.include_router(auth_router)
 
 ingestion_graph = build_ingestion_graph()
 query_graph = build_query_graph()
+positioning_graph = build_positioning_graph()
 
 UPLOAD_DIR = "uploaded_pdfs"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-def get_connection():
-    return psycopg2.connect(DATABASE_URL)
+def require_user(token: str) -> str:
+    user_id = validate_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return user_id
 
 
-def init_db():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS rpa_sessions (
-            session_id UUID PRIMARY KEY,
-            chat_history JSONB DEFAULT '[]'::jsonb,
-            created_at TIMESTAMP DEFAULT NOW(),
-            user_id UUID,
-            pdf_name TEXT
-        )
-    """)
-    
-    cur.execute("ALTER TABLE rpa_sessions ADD COLUMN IF NOT EXISTS pdf_hash TEXT")
-    cur.execute("ALTER TABLE rpa_sessions ADD COLUMN IF NOT EXISTS summary TEXT")
-    cur.execute("ALTER TABLE rpa_sessions ADD COLUMN IF NOT EXISTS research_gaps JSONB DEFAULT '[]'::jsonb")
-    cur.execute("ALTER TABLE rpa_sessions ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb")
-    conn.commit()
-    cur.close()
-    conn.close()
+def fact(f):
+    """One extracted fact -> plain text ('' if the paper doesn't state it)."""
+    return "" if not f or f["value"] == NOT_STATED else f["value"]
 
 
-def classify_query(query: str) -> str:
-    q = query.lower()
-    if any(w in q for w in ['summary', 'summarize', 'summarise', 'overview']):
-        return 'summary'
-    if any(w in q for w in ['gap', 'gaps', 'limitation', 'limitations', 'future work']):
-        return 'gap'
-    return 'qa'
+def facts(fs):
+    return "; ".join(f["value"] for f in fs or [])
 
 
 @app.on_event("startup")
 def startup():
-    init_collection()
-    init_db()
+    init_db()   # creates the local SQLite file and all tables if they don't exist yet
 
 
 @app.get("/health")
@@ -75,70 +51,43 @@ def health():
 
 @app.post("/upload")
 def upload(file: UploadFile = File(...), token: str = Form(...)):
-    user_id = validate_token(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user_id = require_user(token)
 
     file_bytes = file.file.read()
     pdf_hash = hashlib.sha256(file_bytes).hexdigest()
 
     conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT session_id FROM rpa_sessions WHERE pdf_hash = %s AND user_id = %s",
+    existing = conn.execute(
+        "SELECT session_id FROM rpa_sessions WHERE pdf_hash = ? AND user_id = ?",
         (pdf_hash, user_id)
-    )
-    existing = cur.fetchone()
+    ).fetchone()
+    conn.close()
     if existing:
-        cur.close()
-        conn.close()
-        return {
-            "session_id": str(existing[0]),
-            "message": "PDF already processed. Reusing existing session."
-        }
+        return {"session_id": existing[0], "message": "PDF already processed. Reusing existing session."}
 
     session_id = str(uuid.uuid4())
     file_path = os.path.join(UPLOAD_DIR, f"{session_id}.pdf")
-
     with open(file_path, "wb") as f:
         f.write(file_bytes)
 
-    state = {
+    result = ingestion_graph.invoke({
         'session_id': session_id,
+        'paper_id': session_id,
         'pdf_path': file_path,
-        'query': '',
-        'query_type': '',
         'chunks': [],
-        'retrieved_docs': [],
-        'web_search_triggered': False,
-        'summary': '',
-        'research_gaps': [],
-        'answer': '',
-        'citations': [],
-        'chat_history': [],
-        'metadata': {}       
-    }
+        'tables': [],
+        'extracted': {},
+    })
+    if result.get('error'):
+        raise HTTPException(status_code=500, detail=result['error'])
 
-    result = ingestion_graph.invoke(state)
-
-    cur.execute(
-        """INSERT INTO rpa_sessions
-           (session_id, chat_history, user_id, pdf_name, pdf_hash, summary, research_gaps, metadata)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-        (
-            session_id,
-            json.dumps([]),
-            user_id,
-            file.filename,
-            pdf_hash,
-            result.get('summary', ''),
-            json.dumps(result.get('research_gaps', [])),
-            json.dumps(result.get('metadata', {}))
-        )
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO rpa_sessions (session_id, user_id, pdf_name, pdf_hash, chat_history, extracted)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (session_id, user_id, file.filename, pdf_hash, json.dumps([]), json.dumps(result.get('extracted', {})))
     )
     conn.commit()
-    cur.close()
     conn.close()
 
     return {"session_id": session_id, "message": "PDF processed successfully"}
@@ -152,85 +101,40 @@ class QueryRequest(BaseModel):
 
 @app.post("/query")
 def query(req: QueryRequest):
-    user_id = validate_token(req.token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user_id = require_user(req.token)
 
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT chat_history, summary, research_gaps FROM rpa_sessions WHERE session_id = %s AND user_id = %s",
+    row = conn.execute(
+        "SELECT chat_history FROM rpa_sessions WHERE session_id = ? AND user_id = ?",
         (req.session_id, user_id)
-    )
-    row = cur.fetchone()
-
+    ).fetchone()
+    conn.close()
     if row is None:
-        cur.close()
-        conn.close()
         raise HTTPException(status_code=404, detail="Session not found")
 
-    chat_history = row[0]
-    cached_summary = row[1]
-    cached_gaps = row[2]
+    chat_history = loads(row[0], [])
 
-    query_type = classify_query(req.query)
+    result = query_graph.invoke({
+        'session_id': req.session_id,
+        'query': req.query,
+        'chat_history': chat_history,
+        'retrieved_docs': [],
+    })
+    answer, citations = result.get('answer', ''), result.get('citations', [])
 
-    if query_type == 'summary':
-        response_text = cached_summary
-        response_payload = {
-            'query_type': 'summary',
-            'summary': cached_summary,
-            'research_gaps': None,
-            'answer': None,
-            'citations': None
-        }
-    elif query_type == 'gap':
-        response_text = str(cached_gaps)
-        response_payload = {
-            'query_type': 'gap',
-            'summary': None,
-            'research_gaps': cached_gaps,
-            'answer': None,
-            'citations': None
-        }
-    else:
-        state = {
-            'session_id': req.session_id,
-            'pdf_path': '',
-            'query': req.query,
-            'query_type': 'qa',
-            'chunks': [],
-            'retrieved_docs': [],
-            'web_search_triggered': False,
-            'summary': '',
-            'research_gaps': [],
-            'answer': '',
-            'citations': [],
-            'chat_history': chat_history,
-            'metadata': {}
-        }
-        result = query_graph.invoke(state)
-        response_text = result['answer']
-        response_payload = {
-            'query_type': 'qa',
-            'summary': None,
-            'research_gaps': None,
-            'answer': result.get('answer'),
-            'citations': result.get('citations')
-        }
-
+    # citations are saved too, so reopening a paper shows the full chat with its sources
     chat_history.append({'role': 'user', 'content': req.query})
-    chat_history.append({'role': 'assistant', 'content': str(response_text)})
+    chat_history.append({'role': 'assistant', 'content': answer, 'citations': citations})
 
-    cur.execute(
-        "UPDATE rpa_sessions SET chat_history = %s WHERE session_id = %s",
+    conn = get_connection()
+    conn.execute(
+        "UPDATE rpa_sessions SET chat_history = ? WHERE session_id = ?",
         (json.dumps(chat_history), req.session_id)
     )
     conn.commit()
-    cur.close()
     conn.close()
 
-    return response_payload
+    return {'answer': answer, 'citations': citations}
 
 
 class TokenRequest(BaseModel):
@@ -239,111 +143,142 @@ class TokenRequest(BaseModel):
 
 @app.post("/my-sessions")
 def my_sessions(req: TokenRequest):
-    user_id = validate_token(req.token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user_id = require_user(req.token)
 
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT session_id, pdf_name, created_at FROM rpa_sessions WHERE user_id = %s ORDER BY created_at DESC",
+    rows = conn.execute(
+        "SELECT session_id, pdf_name, created_at FROM rpa_sessions WHERE user_id = ? ORDER BY created_at DESC",
         (user_id,)
-    )
-    rows = cur.fetchall()
-    cur.close()
+    ).fetchall()
     conn.close()
 
-    return {
-        "sessions": [
-            {"session_id": str(r[0]), "pdf_name": r[1], "created_at": str(r[2])}
-            for r in rows
-        ]
-    }
+    return {"sessions": [{"session_id": r[0], "pdf_name": r[1], "created_at": str(r[2])} for r in rows]}
 
 
 class CompareRequest(BaseModel):
     session_ids: list[str]
     token: str
 
+
 @app.post("/compare")
 def compare(req: CompareRequest):
-    user_id = validate_token(req.token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
+    """Compare the user's own papers: a facts table built in code + a short LLM write-up of the differences."""
+    user_id = require_user(req.token)
     if len(req.session_ids) < 2:
         raise HTTPException(status_code=400, detail="Select at least 2 papers to compare")
 
     conn = get_connection()
-    cur = conn.cursor()
-
     papers = []
     for sid in req.session_ids:
-        cur.execute(
-            "SELECT pdf_name, summary, metadata FROM rpa_sessions WHERE session_id = %s AND user_id = %s",
+        row = conn.execute(
+            "SELECT pdf_name, extracted FROM rpa_sessions WHERE session_id = ? AND user_id = ?",
             (sid, user_id)
-        )
-        row = cur.fetchone()
+        ).fetchone()
         if row is None:
-            cur.close()
             conn.close()
             raise HTTPException(status_code=404, detail=f"Session {sid} not found")
-        papers.append({"pdf_name": row[0], "summary": row[1], "metadata": row[2]})
-
-    cur.close()
+        papers.append({"session_id": sid, "pdf_name": row[0], "ex": loads(row[1], {}) or {}})
     conn.close()
 
-    paper_block = "\n\n".join([
-        f"Paper {i+1}: {p['pdf_name']}\nSummary: {p['summary']}\nKey Metadata: {json.dumps(p['metadata'])}"
-        for i, p in enumerate(papers)
-    ])
+    # 1. the table: straight from the grounded facts, no LLM involved
+    table = [{
+        "Paper": p["ex"].get("title") or p["pdf_name"],
+        "Year": p["ex"].get("year", ""),
+        "Problem": fact(p["ex"].get("problem")),
+        "Method": fact(p["ex"].get("method")),
+        "Datasets": facts(p["ex"].get("datasets")),
+        "Metrics": facts(p["ex"].get("metrics")),
+        "Key results": facts(p["ex"].get("results")),
+        "Limitations": facts(p["ex"].get("limitations")),
+    } for p in papers]
 
-    prompt = f"""You are a research analyst comparing multiple research papers.
+    # 2. the write-up: the LLM only sees those same facts
+    block = "\n\n".join(
+        "\n".join(f"{k}: {v or 'not stated'}" for k, v in row.items()) for row in table
+    )
+    prompt = f"""Compare these research papers using ONLY the facts below.
 
-{paper_block}
+{block}
 
-Provide a structured comparison covering:
-1. Core problem each paper addresses
-2. Methodological differences
-3. Key findings and how they relate or conflict
-4. Complementary contributions — what each adds that the others don't
-5. Which paper's approach is strongest and why
+Write a short comparison in markdown with these sections:
+1. **Same problem?** - how their problems relate
+2. **Key differences in method**
+3. **Results** - compare only where they use the same dataset and metric; otherwise say they can't be compared directly
+4. **Which to use when**
 
-Be specific. Reference paper names, not Paper 1/Paper 2."""
+Refer to papers by title. If a fact is 'not stated', don't guess it."""
 
-    response = compare_llm.invoke(prompt)
+    try:
+        comparison = text_call(prompt)
+    except RateLimited as e:
+        raise HTTPException(status_code=429, detail=str(e))
 
     return {
-        "comparison": response.content,
-        "papers": [{"session_id": sid, "pdf_name": p["pdf_name"]} for sid, p in zip(req.session_ids, papers)]
+        "comparison": comparison,
+        "table": table,
+        "papers": [{"session_id": p["session_id"], "pdf_name": p["pdf_name"]} for p in papers],
     }
+
 
 class SessionDataRequest(BaseModel):
     session_id: str
     token: str
 
+
 @app.post("/session-data")
 def session_data(req: SessionDataRequest):
-    user_id = validate_token(req.token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user_id = require_user(req.token)
 
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT summary, research_gaps, metadata, pdf_name FROM rpa_sessions WHERE session_id = %s AND user_id = %s",
+    row = conn.execute(
+        "SELECT pdf_name, extracted, chat_history FROM rpa_sessions WHERE session_id = ? AND user_id = ?",
         (req.session_id, user_id)
-    )
-    row = cur.fetchone()
-    cur.close()
+    ).fetchone()
     conn.close()
-
     if row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
     return {
-        "summary": row[0],
-        "research_gaps": row[1],
-        "metadata": row[2],
-        "pdf_name": row[3]
+        "pdf_name": row[0],
+        "extracted": loads(row[1], None),
+        "chat_history": loads(row[2], []),
     }
+
+
+class PositioningRequest(BaseModel):
+    session_id: str
+    token: str
+    refresh: bool = False
+
+
+@app.post("/positioning")
+def positioning(req: PositioningRequest):
+    user_id = require_user(req.token)
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT extracted, positioning FROM rpa_sessions WHERE session_id = ? AND user_id = ?",
+        (req.session_id, user_id)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    extracted, cached = loads(row[0], None), loads(row[1], None)
+    if cached and not req.refresh:          # already analysed -> no API calls at all
+        return cached
+    if not extracted:
+        raise HTTPException(status_code=400, detail="This paper has no extracted facts. Re-upload it first.")
+
+    result = positioning_graph.invoke({"mode": "paper", "extracted": extracted})
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    conn = get_connection()
+    conn.execute(
+        "UPDATE rpa_sessions SET positioning = ? WHERE session_id = ?",
+        (json.dumps(result["positioning"]), req.session_id)
+    )
+    conn.commit()
+    conn.close()
+    return result["positioning"]

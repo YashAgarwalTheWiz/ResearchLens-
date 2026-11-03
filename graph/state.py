@@ -1,38 +1,34 @@
-from typing import TypedDict,List
+from typing import TypedDict, List
 
-class PaperMetadata(TypedDict):
-    title:str
-    authors:List[str]
-    year:str
-    dataset:List[str]
-    methodology:str
-    metrics:List[str]
-    limitations:List[str]
-    future_work:List[str]
 
 class CitationObject(TypedDict):
-    chunk_text:str
-    page_number:int
-    chunk_index:int
+    chunk_text: str
+    page_number: int
+    chunk_index: int
+    section: str
+
 
 class RetrievedDoc(TypedDict):
-    chunk_text:str
-    page_number:int
-    chunk_index:int
-    relevance_score:float
+    chunk_text: str
+    page_number: int
+    chunk_index: int
+    relevance_score: float
+    section: str
 
-class ResearchState(TypedDict):
-    metadata:PaperMetadata
+
+class ResearchState(TypedDict, total=False):
+    # --- ingestion (upload a paper) ---
     session_id: str
-    pdf_path:str
-    query:str
-    query_type:str
-    chunks:List[CitationObject]
-    retrieved_docs:List[RetrievedDoc]
-    web_search_triggered:bool
-    summary:str
-    research_gaps:List
-    answer:str
-    citations:List[CitationObject]
-    chat_history:List
-    
+    paper_id: str
+    pdf_path: str
+    chunks: List[CitationObject]
+    tables: list
+    extracted: dict
+    error: str
+
+    # --- question answering (Ask tab) ---
+    query: str
+    chat_history: List
+    retrieved_docs: List[RetrievedDoc]
+    answer: str
+    citations: List[dict]

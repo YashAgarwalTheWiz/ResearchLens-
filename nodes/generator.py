@@ -1,31 +1,41 @@
-from langchain_groq import ChatGroq
-from config import GROQ_API_KEY
+from config import QA_HISTORY_MESSAGES
 from graph.state import ResearchState
+from services.llm_service import text_call, RateLimited
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=GROQ_API_KEY)
+NOT_FOUND = "I couldn't find this in the paper."
 
-def generator(state:ResearchState)->dict:
-    context = "\n\n".join([doc['chunk_text'] for doc in state['retrieved_docs']])
-    chat_history_str = ""
-    for message in state['chat_history']:
-        chat_history_str += f"{message['role'].capitalize()}: {message['content']}\n"
-    prompt=f"""
-        You are a research paper assistant. Answer the user's question using only the provided context from the paper.
 
-        Context:
-        {context}
+def generator(state: ResearchState) -> dict:
+    docs = state.get('retrieved_docs', [])
+    if not docs:
+        return {'answer': NOT_FOUND}
 
-        Previous conversation:
-        {chat_history_str}
+    # label each excerpt [S1], [S2], ... so the answer can point at its sources
+    context = "\n\n".join(
+        f"[S{i}] (page {d['page_number']}, {d['section']})\n{d['chunk_text']}"
+        for i, d in enumerate(docs, start=1)
+    )
+    history = state.get('chat_history', [])[-QA_HISTORY_MESSAGES:]
+    history_text = "\n".join(f"{m['role'].capitalize()}: {m['content'][:500]}" for m in history) or "(none)"
 
-        Current question:
-        {state['query']}
+    prompt = f"""You are a research paper assistant. Answer the question using ONLY the excerpts from the paper below.
 
-        Rules:
-        - Answer strictly from the context. Do not make up information.
-        - If the context does not contain enough information to answer, say so explicitly.
-        - Be concise and precise.
-        - Do not repeat the question back.
-    """
-    response=llm.invoke(prompt)
-    return {'answer':response.content}
+Excerpts:
+{context}
+
+Previous conversation (for context only):
+{history_text}
+
+Question: {state['query']}
+
+Rules:
+- After each sentence, cite the excerpt(s) it comes from, like [S1] or [S2][S4].
+- If the excerpts don't contain the answer, reply exactly: "{NOT_FOUND}"
+- Do not use outside knowledge. Be concise. Don't repeat the question."""
+
+    try:
+        return {'answer': text_call(prompt)}
+    except RateLimited as e:
+        return {'answer': str(e)}
+    except Exception as e:
+        return {'answer': f"Answer generation failed: {e}"}

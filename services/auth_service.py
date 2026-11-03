@@ -1,13 +1,9 @@
 import uuid
-import psycopg2
 from passlib.context import CryptContext
-from config import DATABASE_URL
+
+from services.db import get_connection
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-
-def get_connection():
-    return psycopg2.connect(DATABASE_URL)
 
 
 # --- Password helpers ---
@@ -24,23 +20,18 @@ def verify_password(password: str, hashed: str) -> bool:
 
 def register_user(email: str, password: str) -> dict:
     conn = get_connection()
-    cur = conn.cursor()
 
     # Prevent duplicate accounts
-    cur.execute("SELECT user_id FROM rpa_users WHERE email = %s", (email,))
-    if cur.fetchone():
-        cur.close()
+    if conn.execute("SELECT user_id FROM rpa_users WHERE email = ?", (email,)).fetchone():
         conn.close()
         return {"success": False, "message": "Email already registered"}
 
-    hashed = hash_password(password)
-    cur.execute(
-        "INSERT INTO rpa_users (email, password_hash) VALUES (%s, %s) RETURNING user_id",
-        (email, hashed)
+    user_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO rpa_users (user_id, email, password_hash) VALUES (?, ?, ?)",
+        (user_id, email, hash_password(password))
     )
-    user_id = str(cur.fetchone()[0])
     conn.commit()
-    cur.close()
     conn.close()
     return {"success": True, "user_id": user_id}
 
@@ -49,18 +40,14 @@ def register_user(email: str, password: str) -> dict:
 
 def login_user(email: str, password: str) -> dict:
     conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute("SELECT user_id, password_hash FROM rpa_users WHERE email = %s", (email,))
-    row = cur.fetchone()
-    cur.close()
+    row = conn.execute("SELECT user_id, password_hash FROM rpa_users WHERE email = ?", (email,)).fetchone()
     conn.close()
 
     # Same error message for wrong email or wrong password — don't leak which one
     if not row:
         return {"success": False, "message": "Invalid email or password"}
 
-    user_id, stored_hash = str(row[0]), row[1]
+    user_id, stored_hash = row[0], row[1]
 
     if not verify_password(password, stored_hash):
         return {"success": False, "message": "Invalid email or password"}
@@ -74,13 +61,8 @@ def login_user(email: str, password: str) -> dict:
 def generate_token(user_id: str) -> str:
     token = str(uuid.uuid4())
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO rpa_user_tokens (token, user_id) VALUES (%s, %s)",
-        (token, user_id)
-    )
+    conn.execute("INSERT INTO rpa_user_tokens (token, user_id) VALUES (?, ?)", (token, user_id))
     conn.commit()
-    cur.close()
     conn.close()
     return token
 
@@ -88,12 +70,6 @@ def generate_token(user_id: str) -> str:
 def validate_token(token: str) -> str | None:
     """Returns user_id if token is valid, None if not."""
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT user_id FROM rpa_user_tokens WHERE token = %s",
-        (token,)
-    )
-    row = cur.fetchone()
-    cur.close()
+    row = conn.execute("SELECT user_id FROM rpa_user_tokens WHERE token = ?", (token,)).fetchone()
     conn.close()
-    return str(row[0]) if row else None
+    return row[0] if row else None
