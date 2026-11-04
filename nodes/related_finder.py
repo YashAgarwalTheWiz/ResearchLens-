@@ -1,4 +1,5 @@
 import re
+from datetime import date
 from difflib import SequenceMatcher
 
 import numpy as np
@@ -38,12 +39,41 @@ def relation(year, our_year):
     return "earlier" if year < our_year else "same year" if year == our_year else "later"
 
 
+CITATION_BOOST = 0.02   # small tie-breaker: a well-cited paper edges out an equally similar obscure one
+
+
 def cosine_rank(our_text, papers):
+    """Rank by meaning first; citations only break near-ties (log scale, so 10 vs 1000 citations
+    adds ~0.09 at most). The returned score is the pure similarity, so the UI stays honest."""
     docs = [f"{p['title']}. {p['abstract']}"[:2000] for p in papers]
     q = np.array(get_embeddings([our_text], input_type="search_query")[0])
     d = np.array(get_embeddings(docs, input_type="search_document"))
-    scores = d @ q / (np.linalg.norm(d, axis=1) * np.linalg.norm(q) + 1e-9)
-    return [(float(s), p) for s, p in sorted(zip(scores, papers), key=lambda x: -x[0])]
+    sims = d @ q / (np.linalg.norm(d, axis=1) * np.linalg.norm(q) + 1e-9)
+    boost = np.array([CITATION_BOOST * np.log1p(p.get("citation_count") or 0) for p in papers])
+    order = np.argsort(-(sims + boost))
+    return [(float(sims[i]), papers[i]) for i in order]
+
+
+PER_QUERY = 2       # every search query is guaranteed this many places in the final list
+NUM_QUERIES = 5     # one per part of the work: task, method, language/data, setting, evaluation
+RECENT_YEARS = 5    # each query is also searched within the last N years, so new work isn't buried
+
+
+def pick_diverse(ranked, hits_by_query, k=RELATED_TOP_K, per_query=PER_QUERY):
+    """Don't let one theme crowd out the rest: first take the best `per_query` papers found by EACH
+    query, then fill the remaining places by overall rank. Final list stays in overall rank order."""
+    position = {p["id"]: i for i, (_, p) in enumerate(ranked)}
+    chosen = set()
+    for ids in hits_by_query.values():
+        found = sorted((position[i] for i in set(ids) if i in position), key=int)
+        for pos in [x for x in found if x not in chosen][:per_query]:
+            if len(chosen) < k:
+                chosen.add(pos)
+    for pos in range(len(ranked)):
+        if len(chosen) >= k:
+            break
+        chosen.add(pos)
+    return [ranked[pos] for pos in sorted(chosen)]
 
 
 def related_finder(state: PositioningState) -> dict:
@@ -52,14 +82,22 @@ def related_finder(state: PositioningState) -> dict:
         if len(our_text) < 30:
             return {"error": "Not enough information to search for related work."}
 
-        # 1. three short keyword queries (cheap model, one call)
+        # 1. short keyword queries, one per distinct part of the work (cheap model, one call)
         queries = structured_call(
             SearchQueriesOut,
-            "Write 3 different keyword search queries (3-8 words each) that would find research papers "
-            "on the same problem or using the same approach as the work below. Plain words only: "
-            "no quotes, no AND/OR.\n\nWork:\n" + our_text[:2000],
+            f"Write {NUM_QUERIES} search queries to find published research papers related to the work below.\n"
+            "Rules:\n"
+            "- Each query is 2-5 words.\n"
+            "- Use the standard technical terms researchers put in paper TITLES, not phrases copied from "
+            "the description. Examples: 'automatic question generation', 'Indic language models', "
+            "'post-OCR error correction', 'on-device language models', 'citation verification'.\n"
+            "- Each query covers ONE different part of the work: the main task, the method or model, "
+            "the input/data (e.g. OCR, scanned documents), the language or domain, and the setting or "
+            "evaluation. Don't leave out any important part.\n"
+            "- Plain words only: no quotes, no AND/OR.\n\n"
+            "Work:\n" + our_text[:2000],
             fast=True,
-        ).queries[:3]
+        ).queries[:NUM_QUERIES]
 
         # 2. is our paper itself on OpenAlex?
         self_id = None
@@ -83,11 +121,14 @@ def related_finder(state: PositioningState) -> dict:
             add(work.get("related_works", []), "related (OpenAlex)")
             add([p["id"] for p in oa.citing_works(self_id)], "cites this paper")
 
-        search_hits = []
+        # each query twice: all years (classics) + recent years only (so new work isn't buried)
+        recent_from = date.today().year - RECENT_YEARS
+        search_hits, hits_by_query = [], {}
         for q in queries:
-            hits = oa.search(q)
+            hits = oa.search(q, per_page=15) + oa.search(q, per_page=15, since_year=recent_from)
             search_hits.extend(hits)
-            add([h["id"] for h in hits], "search")
+            hits_by_query[q] = [h["id"] for h in hits]
+            add(hits_by_query[q], "search")
 
         if not self_id:
             # our paper isn't indexed (or it's just an idea): borrow OpenAlex's
@@ -108,8 +149,8 @@ def related_finder(state: PositioningState) -> dict:
         if not full:
             return {"error": "Related papers were found, but none had an abstract to compare against."}
 
-        # 6. rank by meaning, not by keywords, and keep the top K
-        ranked = cosine_rank(our_text, full)[:RELATED_TOP_K]
+        # 6. rank by meaning, then keep the top K while making sure every query's theme is represented
+        ranked = pick_diverse(cosine_rank(our_text, full), hits_by_query)
 
     except RateLimited as e:
         return {"error": str(e)}

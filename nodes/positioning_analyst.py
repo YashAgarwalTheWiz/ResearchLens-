@@ -83,7 +83,8 @@ FIELD COVERAGE (counted by code, trust these numbers):
 {cov_text}
 
 Produce:
-1. summary: 2-3 sentences on how this work relates to the related papers. Cite papers inline like [P3].
+1. summary: 2-3 sentences on where this work stands among the related papers. Do NOT restate the work
+   itself; start with how it relates to them. Cite each paper on its own, like [P3] or [P2][P5].
 2. contributions: for each main contribution of OUR work (max 4): the claim, the closest related papers
    (closest_refs), how ours differs, and overlap = low / partial / high. Prefer papers published earlier
    than ours when judging if something was already done.
@@ -94,6 +95,14 @@ Produce:
 Rules:
 - Only use refs from the list above (P1, P2, ...). Never invent papers.
 - Every contribution and every gap MUST cite at least one ref.
+- Judge overlap strictly. If ANY related paper tackles the same task with a similar method OR a similar
+  evaluation, overlap is at least "partial"; if one already does essentially the same thing, it is "high".
+  Use "low" only when no related paper does anything close.
+- You only see ABSTRACTS. Never claim that related work "does not do" or "does not report" something just
+  because an abstract doesn't mention it. Say "none of the related abstracts mention ..." instead.
+- Describe OUR work using only what is stated above. Do not add numbers, model sizes, datasets or details
+  that are not there.
+- Every contribution must be distinct. If two overlap (e.g. both about robustness), merge them into one.
 - Only say what the facts above support. If unsure, leave it out."""
 
     try:

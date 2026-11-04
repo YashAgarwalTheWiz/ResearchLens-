@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 
 from graph.positioning_state import PositioningState
 
-REF_PATTERN = re.compile(r"\[(P\d+)\]")
+# matches [P3] or (P3), and lists like [P2, P3, P6], (P5,P6) or [P2, P3 and P6]
+REF_PATTERN = re.compile(r"[\[(](P\d+(?:\s*(?:,|and|&)\s*P\d+)*)[\])]")
 
 
 def citation_verifier(state: PositioningState) -> dict:
@@ -37,10 +38,10 @@ def citation_verifier(state: PositioningState) -> dict:
             continue
         gaps.append({**g, "refs": refs, "sources": [source(r) for r in refs]})
 
-    # summary: turn real [P3] into links, remove any [P99] the model invented
+    # summary: turn real [P3] / (P3) into links, remove any [P99] the model invented
     def link(m):
-        ref = m.group(1)
-        return f"[[{ref}]]({papers[ref]['url']})" if ref in papers else ""
+        refs = re.findall(r"P\d+", m.group(1))
+        return " ".join(f"[[{ref}]]({papers[ref]['url']})" for ref in refs if ref in papers)
     summary = REF_PATTERN.sub(link, analysis["summary"])
     summary = re.sub(r"[ \t]+([.,;:])", r"\1", summary).replace("  ", " ").strip()   # tidy gaps left behind
 

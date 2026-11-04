@@ -7,6 +7,7 @@ Run from the project root:  python -m eval.grounding_eval
 2. Related-paper precision: are the 10 papers actually related? Needs YOUR judgement:
    the first run writes eval/related_labels.csv -> fill the 'relevant' column with y or n
    -> run again to get precision.
+3. Reference check: share of cited references found and matched on OpenAlex (if you ran it).
 """
 import csv
 import os
@@ -70,3 +71,17 @@ else:
     print(f"Related-paper precision: {hits / len(judged):.1%} ({hits} of {len(judged)} judged papers are relevant)")
     if len(judged) < len(out):
         print(f"({len(out) - len(judged)} rows still unlabelled in {LABELS})")
+
+# ---------- 3. reference check ----------
+conn = get_connection()
+ref_rows = conn.execute("SELECT pdf_name, ref_check FROM rpa_sessions WHERE ref_check IS NOT NULL").fetchall()
+conn.close()
+if ref_rows and any(loads(r[1], {}).get("counts") for r in ref_rows):
+    totals = {"verified": 0, "check": 0, "not_found": 0}
+    for _, raw in ref_rows:
+        for k, v in loads(raw, {}).get("counts", {}).items():
+            totals[k] += v
+    n = sum(totals.values())
+    print(f"\nReference check across {len(ref_rows)} papers ({n} references): "
+          f"{totals['verified'] / n:.1%} verified, {totals['check'] / n:.1%} to check, "
+          f"{totals['not_found'] / n:.1%} not found on OpenAlex")

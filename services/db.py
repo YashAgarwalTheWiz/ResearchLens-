@@ -1,4 +1,4 @@
-"""One local SQLite file holds everything: users, tokens, sessions, chunks.
+"""One local SQLite file holds everything: users, tokens, sessions, chunks, idea checks.
 SQLite is built into Python, so there is nothing to install or sign up for."""
 import json
 import os
@@ -21,6 +21,14 @@ def loads(value, default):
     if value in (None, ""):
         return default
     return json.loads(value)
+
+
+def _add_missing_columns(conn, table, columns):
+    """SQLite has no 'ADD COLUMN IF NOT EXISTS', so check first. Lets old databases upgrade in place."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, sql_type in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
 
 def init_db():
@@ -63,6 +71,22 @@ def init_db():
             embedding BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_session ON rpa_chunks (session_id);
+
+        CREATE TABLE IF NOT EXISTS rpa_ideas (
+            idea_hash TEXT NOT NULL,
+            user_id TEXT NOT NULL REFERENCES rpa_users(user_id),
+            idea_text TEXT NOT NULL,
+            positioning TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (idea_hash, user_id)
+        );
     """)
+    # new columns for upload progress + reference check (added to old databases automatically)
+    _add_missing_columns(conn, "rpa_sessions", {
+        "status": "TEXT DEFAULT 'ready'",     # processing | ready | failed
+        "progress": "TEXT",                   # e.g. "Extracting facts with sources"
+        "error": "TEXT",
+        "ref_check": "TEXT",                  # cached reference-check result (JSON)
+    })
     conn.commit()
     conn.close()

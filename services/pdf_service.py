@@ -22,3 +22,25 @@ def parse_pdf(pdf_path):
             })
             chunk_index += 1
     return result
+
+
+REFERENCE_HEADINGS = {"references", "bibliography", "reference"}
+
+
+def extract_references(pdf_path, max_chars=30000):
+    """The paper's reference list as plain text ('' if we can't find one)."""
+    doc = fitz.open(pdf_path)
+    pages_lines = [get_lines(page) for page in doc]
+
+    # 1. normal case: the section detector found a 'References' heading
+    segments = detect_sections(pages_lines, drop={"acknowledgments"})
+    text = "\n".join(seg["text"] for seg in segments if seg["section"] == "references")
+
+    # 2. fallback: take everything after the LAST line that just says "References"
+    if not text.strip():
+        lines = [ln["text"] for page in pages_lines for ln in page]
+        starts = [i for i, t in enumerate(lines) if t.strip().rstrip(":").lower() in REFERENCE_HEADINGS]
+        if starts:
+            text = "\n".join(lines[starts[-1] + 1:])
+
+    return text[:max_chars]

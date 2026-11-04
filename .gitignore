@@ -6,3 +6,4 @@ data/
 uploaded_pdfs/
 eval/related_labels.csv
 eval/chunks_*.json
+papers/

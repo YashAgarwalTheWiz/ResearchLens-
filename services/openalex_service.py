@@ -1,4 +1,6 @@
+import re
 import time
+
 import requests
 
 from config import OPENALEX_API_KEY
@@ -8,6 +10,7 @@ BASE = "https://api.openalex.org"
 LIGHT_FIELDS = "id,display_name,publication_year"
 DETAIL_FIELDS = "id,display_name,publication_year,doi,cited_by_count,abstract_inverted_index,primary_location"
 WORK_FIELDS = "id,display_name,publication_year,referenced_works,related_works"
+MATCH_FIELDS = "id,display_name,publication_year,doi,authorships"
 
 MIN_GAP = 0.1      # a free key allows ~30 requests/second; we stay well under that
 _last_call = 0.0
@@ -86,9 +89,12 @@ def _list(params):
 
 
 # ---------- the calls our nodes use ----------
-def search(query, per_page=20):
-    """Keyword search over titles + abstracts."""
-    return _list({"search": query, "per_page": per_page, "select": LIGHT_FIELDS})
+def search(query, per_page=20, since_year=None):
+    """Keyword search over titles + abstracts. since_year limits it to recent work."""
+    params = {"search": query, "per_page": per_page, "select": LIGHT_FIELDS}
+    if since_year:
+        params["filter"] = f"from_publication_date:{since_year}-01-01"
+    return _list(params)
 
 
 def get_work(work_id):
@@ -118,3 +124,23 @@ def details(work_ids):
         batch = work_ids[i:i + 100]
         papers += _list({"filter": "openalex:" + "|".join(batch), "per_page": 100, "select": DETAIL_FIELDS})
     return papers
+
+
+def find_by_title(title, per_page=3):
+    """Closest works by title (for checking a reference). A filter call: 10x cheaper than search."""
+    clean = re.sub(r"[^A-Za-z0-9 ]", " ", title or "")      # commas/pipes would break the filter syntax
+    clean = " ".join(clean.split())[:200]
+    if len(clean) < 8:
+        return []
+    data = _get("/works", {"filter": f"title.search:{clean}", "per_page": per_page, "select": MATCH_FIELDS})
+    works = []
+    for w in (data or {}).get("results") or []:
+        wid = short_id(w.get("id"))
+        works.append({
+            "id": wid,
+            "title": w.get("display_name") or "",
+            "year": w.get("publication_year"),
+            "url": paper_url(wid, w.get("doi")),
+            "authors": [((a.get("author") or {}).get("display_name") or "") for a in w.get("authorships") or []],
+        })
+    return works

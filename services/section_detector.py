@@ -96,9 +96,10 @@ def looks_like_heading(line, body_size):
     return line["bold"] or line["size"] >= body_size + 1.0
 
 
-def detect_sections(pages_lines):
+def detect_sections(pages_lines, drop=DROP_SECTIONS):
     """
     pages_lines: list (one per page) of lines from get_lines().
+    drop: sections to leave out (by default references + acknowledgments).
     Returns a list of segments: {'section', 'page_number', 'text'}.
     """
     body = body_font_size(pages_lines)
@@ -110,7 +111,7 @@ def detect_sections(pages_lines):
         buffer = []
 
         def flush():
-            if buffer and current not in DROP_SECTIONS:
+            if buffer and current not in drop:
                 segments.append({
                     "section": current,
                     "page_number": page_idx + 1,
