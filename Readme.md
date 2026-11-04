@@ -48,13 +48,19 @@ Idea Check:       the same graph as Where It Stands, started from a text idea in
 | Backend / Frontend                | FastAPI / Streamlit                               |
 | PDF parsing                       | PyMuPDF                                           |
 
-## Evaluation
+## Evaluation (in progress)
 
-| Metric                                                   | Result    |
-| -------------------------------------------------------- | --------- |
-| Grounding rate (claims citing a real retrieved paper)    | _fill in_ |
-| Related-paper precision (related papers judged relevant) | _fill in_ |
-| References verified on OpenAlex                          | _fill in_ |
+Two things are measured:
+
+1. **Grounding** — every claim in *Where It Stands* must cite a paper that was actually retrieved; claims that don't are removed in code. `eval/grounding_eval.py` reports the share of claims that survived this check, plus reference-check stats.
+2. **Retrieval recall** — whether the truly closest prior work is among the 10 papers found. This is the main limit of the system: the overlap verdict can only be as good as the papers it is compared against. Manual testing showed recall varies by topic (e.g. for a description of LoRA, the LoRA paper itself was not retrieved), so a fixed test set with known closest papers is being built to measure and improve it.
+
+```bash
+# upload + analyse a folder of PDFs (safe to re-run; stops cleanly at the daily API limit)
+python -m eval.run_batch papers/ --email you@example.com --password yourpassword --refs
+# grounding rate, related-paper precision (after labelling eval/related_labels.csv), reference stats
+python -m eval.grounding_eval
+```
 
 How to reproduce:
 
